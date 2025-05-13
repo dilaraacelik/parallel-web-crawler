@@ -2,6 +2,7 @@
 #include <chrono>
 #include <iomanip>
 #include <ctime>
+#include <algorithm>
 
 namespace Utils {
 
@@ -56,7 +57,11 @@ std::string escapeCsvField(const std::string& field) {
     // Check if field contains comma, newline, or double quote
     if (field.find(',') != std::string::npos || 
         field.find('\n') != std::string::npos || 
-        field.find('"') != std::string::npos) {
+        field.find('"') != std::string::npos ||
+        field.find('@') != std::string::npos ||
+        field.find('&') != std::string::npos ||
+        field.find('<') != std::string::npos ||
+        field.find('>') != std::string::npos) {
         
         // Replace double quotes with double-double quotes
         std::string escaped = field;

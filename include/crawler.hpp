@@ -15,8 +15,17 @@ struct CrawlResult {
     std::string description;
     std::string price;
     std::string date;
+    std::string keywords;
+    std::string author;
+    std::string logo;
+    std::vector<std::string> links;
+    std::vector<std::string> images;
+    std::vector<std::string> headings;
     bool success;
     std::string error;
+    
+    // Constructor with default values
+    CrawlResult() : success(false) {}
 };
 
 // Structure to be passed to worker threads
@@ -29,6 +38,7 @@ struct ThreadData {
     int endIndex;
     std::atomic<int>* completedUrls;
     int totalUrls;
+    bool extendedInfo;  // Whether to collect extended information
 };
 
 class Crawler {
@@ -42,6 +52,7 @@ private:
     std::mutex resultsMutex;
     std::atomic<int> completedUrls;
     Parser parser;
+    bool extendedInfo;  // Whether to collect extended information
 
     // Thread worker function
     static void* crawlWorker(void* arg);
@@ -51,9 +62,15 @@ private:
     
     // Save results to output file
     void saveResults();
+    
+    // Save extended results to output file
+    void saveExtendedResults();
+    
+    // Helper function to format URLs for CSV output
+    std::string formatUrlForCsv(const std::string& url);
 
 public:
-    Crawler(const std::vector<std::string>& urls, const std::string& outputFile, int numThreads);
+    Crawler(const std::vector<std::string>& urls, const std::string& outputFile, int numThreads, bool extendedInfo = false);
     ~Crawler();
     
     // Run the crawler with multiple threads
