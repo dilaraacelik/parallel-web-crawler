@@ -1,391 +1,255 @@
 #include "../include/crawler.hpp"
-#include "../include/utils.hpp"
 #include <iostream>
 #include <fstream>
-#include <algorithm>
+#include <sstream>
+#include <regex>
+#include <curl/curl.h>
+#include <filesystem>
+#include <set>
+#include <cctype>
+#include <random>
+#include <array>
+namespace fs = std::filesystem;
 
-#ifdef _WIN32
-// Windows does not have unistd.h, use Windows.h instead for Sleep function
-#include <windows.h>
-// Use pthreads-win32 for Windows
-#define HAVE_STRUCT_TIMESPEC
-#else
-// Unix systems
-#include <unistd.h>
-#endif
-
-Crawler::Crawler(const std::vector<std::string>& urls, const std::string& outputFile, int numThreads, bool extendedInfo)
-    : urls(urls), outputFile(outputFile), numThreads(numThreads), completedUrls(0), extendedInfo(extendedInfo) {
-    
-    // Initialize libcurl
-    if (!Utils::initCurl()) {
-        std::cerr << "Failed to initialize libcurl." << std::endl;
-        exit(1);
-    }
-    
-    // Resize the threads vector
-    threads.resize(numThreads);
-    threadData.resize(numThreads);
-    
-    // Initialize results vector with the size of URLs
-    results.resize(urls.size());
+// Helper to fill string from CURL
+static size_t WriteCallback(void* contents, size_t size, size_t nmemb, std::string* output) {
+    size_t totalSize = size * nmemb;
+    output->append((char*)contents, totalSize);
+    return totalSize;
 }
 
-Crawler::~Crawler() {
-    // Cleanup libcurl
-    Utils::cleanupCurl();
-}
-
-void* Crawler::crawlWorker(void* arg) {
-    ThreadData* data = static_cast<ThreadData*>(arg);
+// Sanitize filename
+std::string sanitizeFilename(const std::string& filename) {
+    std::string result;
+    result.reserve(filename.length());
     
-    // Process URLs in the assigned range
-    for (int i = data->startIndex; i < data->endIndex; i++) {
-        if (i < static_cast<int>(data->urls->size())) {
-            std::string url = (*data->urls)[i];
-            
-            // Process the URL
-            CrawlResult result;
-            result.url = url;
-            
-            // Get HTML content
-            std::string html;
-            std::string error;
-            bool success = Utils::makeHttpRequest(url, html, error);
-            
-            if (success) {
-                // Parse the HTML content
-                Parser parser;
-                if (data->extendedInfo) {
-                    success = parser.parseHtmlExtended(html, url, 
-                                                     result.title, 
-                                                     result.description, 
-                                                     result.price, 
-                                                     result.date,
-                                                     result.keywords,
-                                                     result.author,
-                                                     result.links,
-                                                     result.images,
-                                                     result.headings,
-                                                     result.logo);
-                } else {
-                    success = parser.parseHtml(html, url, 
-                                              result.title, 
-                                              result.description, 
-                                              result.price, 
-                                              result.date);
-                }
-                result.success = success;
-                if (!success) {
-                    result.error = "Failed to parse HTML content";
-                }
-            } else {
-                result.success = false;
-                result.error = error;
-            }
-            
-            // Add result to the results vector using a mutex to synchronize access
-            {
-                std::lock_guard<std::mutex> lock(*data->resultsMutex);
-                (*data->results)[i] = result;
-            }
-            
-            // Increment the completed count and print progress
-            int completed = ++(*data->completedUrls);
-            if (data->id == 0) { // Only thread 0 prints progress
-                Utils::printProgress(completed, data->totalUrls);
-            }
-        }
-    }
-    
-    return nullptr;
-}
-
-void Crawler::run() {
-    std::cout << "Starting crawler with " << numThreads << " threads." << std::endl;
-    if (extendedInfo) {
-        std::cout << "Extended information will be collected." << std::endl;
-    }
-    
-    // Calculate URLs per thread (dividing work evenly)
-    int urlsPerThread = urls.size() / numThreads;
-    int extraUrls = urls.size() % numThreads;
-    
-    int startIndex = 0;
-    
-    // Create and start threads
-    for (int i = 0; i < numThreads; i++) {
-        threadData[i].id = i;
-        threadData[i].urls = &urls;
-        threadData[i].results = &results;
-        threadData[i].resultsMutex = &resultsMutex;
-        threadData[i].startIndex = startIndex;
-        threadData[i].completedUrls = &completedUrls;
-        threadData[i].totalUrls = urls.size();
-        threadData[i].extendedInfo = extendedInfo;
-        
-        // Calculate the end index for this thread
-        // Add an extra URL to the first 'extraUrls' threads to distribute the remainder
-        int urlsForThisThread = urlsPerThread + (i < extraUrls ? 1 : 0);
-        threadData[i].endIndex = startIndex + urlsForThisThread;
-        
-        // Update start index for the next thread
-        startIndex = threadData[i].endIndex;
-        
-        // Create the thread
-        pthread_create(&threads[i], nullptr, crawlWorker, &threadData[i]);
-    }
-    
-    // Wait for all threads to complete
-    for (int i = 0; i < numThreads; i++) {
-        pthread_join(threads[i], nullptr);
-    }
-    
-    // Save results to file
-    if (extendedInfo) {
-        saveExtendedResults();
-    } else {
-        saveResults();
-    }
-}
-
-void Crawler::runSingleThreaded() {
-    std::cout << "Starting crawler in single-threaded mode." << std::endl;
-    if (extendedInfo) {
-        std::cout << "Extended information will be collected." << std::endl;
-    }
-    
-    completedUrls = 0;
-    
-    // Process all URLs sequentially
-    for (size_t i = 0; i < urls.size(); i++) {
-        results[i] = processSingleUrl(urls[i]);
-        
-        // Update progress
-        completedUrls++;
-        Utils::printProgress(completedUrls, urls.size());
-    }
-    
-    // Save results to file
-    if (extendedInfo) {
-        saveExtendedResults();
-    } else {
-        saveResults();
-    }
-}
-
-CrawlResult Crawler::processSingleUrl(const std::string& url) {
-    CrawlResult result;
-    result.url = url;
-    
-    // Get HTML content
-    std::string html;
-    std::string error;
-    bool success = Utils::makeHttpRequest(url, html, error);
-    
-    if (success) {
-        // Parse the HTML content
-        if (extendedInfo) {
-            success = parser.parseHtmlExtended(html, url, 
-                                             result.title, 
-                                             result.description, 
-                                             result.price, 
-                                             result.date,
-                                             result.keywords,
-                                             result.author,
-                                             result.links,
-                                             result.images,
-                                             result.headings,
-                                             result.logo);
+    for (char c : filename) {
+        if (std::isalnum(c) || c == '.' || c == '-' || c == '_') {
+            result += c;
         } else {
-            success = parser.parseHtml(html, url, 
-                                      result.title, 
-                                      result.description, 
-                                      result.price, 
-                                      result.date);
+            result += '_';
         }
-        result.success = success;
-        if (!success) {
-            result.error = "Failed to parse HTML content";
-        }
-    } else {
-        result.success = false;
-        result.error = error;
     }
     
     return result;
 }
 
-void Crawler::saveResults() {
-    std::ofstream file(outputFile);
-    
-    if (!file.is_open()) {
-        std::cerr << "Failed to open output file: " << outputFile << std::endl;
-        return;
-    }
-    
-    // Write header row with spaces after commas
-    file << "URL, Title, Description, Price, Date, Success, Error\n";
-    
-    // Write results with spaces after commas
-    for (const auto& result : results) {
-        file << formatUrlForCsv(result.url) << ", "
-             << Utils::escapeCsvField(result.title) << ", "
-             << Utils::escapeCsvField(result.description) << ", "
-             << Utils::escapeCsvField(result.price) << ", "
-             << Utils::escapeCsvField(result.date) << ", "
-             << (result.success ? "true" : "false") << ", "
-             << Utils::escapeCsvField(result.error) << "\n";
-    }
-    
-    file.close();
+// Realistic User-Agent's
+const std::array<std::string, 5> USER_AGENTS = {
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36 Edg/121.0.0.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:123.0) Gecko/20100101 Firefox/123.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3.1 Safari/605.1.15",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+};
+
+// Select random User-Agent
+std::string getRandomUserAgent() {
+    static std::random_device rd;
+    static std::mt19937 gen(rd());
+    static std::uniform_int_distribution<> dis(0, USER_AGENTS.size() - 1);
+    return USER_AGENTS[dis(gen)];
 }
 
-// Function to properly format URLs in CSV export
-std::string Crawler::formatUrlForCsv(const std::string& url) {
-    // Remove any invalid characters from the beginning
-    std::string cleaned = url;
-    while (!cleaned.empty() && 
-           (cleaned[0] == '@' || cleaned[0] == ' ' || cleaned[0] == '\t' || 
-            cleaned[0] == '\r' || cleaned[0] == '\n')) {
-        cleaned.erase(0, 1);
-    }
+Crawler::Crawler(const std::string& url, int threadId, const std::string& runFolder)
+    : url(url), threadId(threadId) {
+    domain = std::regex_replace(url, std::regex(R"(https?://)"), "");
+    std::replace(domain.begin(), domain.end(), '/', '_');
     
-    // Ensure URLs are properly escaped for CSV
-    return Utils::escapeCsvField(cleaned);
+    // Use directly given run folder
+    folderName = runFolder + "/thread_" + std::to_string(threadId) + "/" + domain;
+    fs::create_directories(folderName);
 }
 
-void Crawler::saveExtendedResults() {
-    std::ofstream file(outputFile);
-    
-    if (!file.is_open()) {
-        std::cerr << "Failed to open output file: " << outputFile << std::endl;
+void Crawler::start() {
+    std::cout << "[Thread " << threadId << "] Downloading main page: " << url << std::endl;
+
+    std::string htmlContent;
+    if (!downloadPage(url, folderName + "/index.html")) {
+        std::cerr << "[Thread " << threadId << "] ERROR: Main page not downloaded: " << url << std::endl;
         return;
     }
-    
-    // Write header row for basic fields with spaces after commas
-    file << "URL, Title, Description, Price, Date, Keywords, Author, Logo, Links Count, Images Count, Headings Count, Success, Error\n";
-    
-    // Write results with spaces after commas
-    for (const auto& result : results) {
-        file << formatUrlForCsv(result.url) << ", "
-             << Utils::escapeCsvField(result.title) << ", "
-             << Utils::escapeCsvField(result.description) << ", "
-             << Utils::escapeCsvField(result.price) << ", "
-             << Utils::escapeCsvField(result.date) << ", "
-             << Utils::escapeCsvField(result.keywords) << ", "
-             << Utils::escapeCsvField(result.author) << ", "
-             << Utils::escapeCsvField(result.logo) << ", "
-             << result.links.size() << ", "
-             << result.images.size() << ", "
-             << result.headings.size() << ", "
-             << (result.success ? "true" : "false") << ", "
-             << Utils::escapeCsvField(result.error) << "\n";
+
+    std::ifstream in(folderName + "/index.html");
+    if (!in.is_open()) {
+        std::cerr << "[Thread " << threadId << "] ERROR: Downloaded file not opened: " << url << std::endl;
+        return;
     }
+
+    std::stringstream buffer;
+    buffer << in.rdbuf();
+    htmlContent = buffer.str();
+
+    std::cout << "[Thread " << threadId << "] Downloading assets: " << url << std::endl;
+    extractAndDownloadAssets(htmlContent, url);
     
-    // Create separate files for detailed data if there's any
-    bool hasLinks = false;
-    bool hasImages = false;
-    bool hasHeadings = false;
-    
-    for (const auto& result : results) {
-        if (!result.links.empty()) hasLinks = true;
-        if (!result.images.empty()) hasImages = true;
-        if (!result.headings.empty()) hasHeadings = true;
-        
-        if (hasLinks && hasImages && hasHeadings) break;
+    std::cout << "[Thread " << threadId << "] Scanning links: " << url << std::endl;
+    crawlLinksFromHtml(htmlContent, url);
+}
+
+bool Crawler::downloadPage(const std::string& pageUrl, const std::string& savePath) {
+    CURL* curl = curl_easy_init();
+    if (!curl) {
+        std::cerr << "[Thread " << threadId << "] ERROR: CURL not initialized" << std::endl;
+        return false;
     }
-    
-    // Save links to a separate file
-    if (hasLinks) {
-        std::string linksFile = outputFile.substr(0, outputFile.find_last_of('.')) + "_links.csv";
-        std::ofstream linkStream(linksFile);
-        
-        if (linkStream.is_open()) {
-            linkStream << "Source URL, Link URL, Link Type\n";
+
+    std::string response;
+    struct curl_slist* headers = nullptr;
+
+    // Add realistic headers
+    headers = curl_slist_append(headers, "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8");
+    headers = curl_slist_append(headers, "Accept-Language: en-US,en;q=0.5");
+    headers = curl_slist_append(headers, "Accept-Encoding: gzip, deflate, br");
+    headers = curl_slist_append(headers, "DNT: 1");
+    headers = curl_slist_append(headers, "Connection: keep-alive");
+    headers = curl_slist_append(headers, "Upgrade-Insecure-Requests: 1");
+    headers = curl_slist_append(headers, "Sec-Fetch-Dest: document");
+    headers = curl_slist_append(headers, "Sec-Fetch-Mode: navigate");
+    headers = curl_slist_append(headers, "Sec-Fetch-Site: none");
+    headers = curl_slist_append(headers, "Sec-Fetch-User: ?1");
+    headers = curl_slist_append(headers, "Cache-Control: max-age=0");
+
+    curl_easy_setopt(curl, CURLOPT_URL, pageUrl.c_str());
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L); // 10 seconds timeout
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 5L); // 5 seconds connection timeout
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, getRandomUserAgent().c_str());
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
+    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+    curl_easy_setopt(curl, CURLOPT_ENCODING, ""); // Automatic gzip support
+    curl_easy_setopt(curl, CURLOPT_IPRESOLVE, CURL_IPRESOLVE_V4); // Only IPv4
+    curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L); // Keep-alive connections
+    curl_easy_setopt(curl, CURLOPT_TCP_KEEPIDLE, 120L); // 120 seconds idle
+    curl_easy_setopt(curl, CURLOPT_TCP_KEEPINTVL, 60L); // 60 seconds interval
+
+    CURLcode res = curl_easy_perform(curl);
+    if (res != CURLE_OK) {
+        std::cerr << "[Thread " << threadId << "] ERROR: " << curl_easy_strerror(res) << " - " << pageUrl << std::endl;
+        curl_slist_free_all(headers);
+        curl_easy_cleanup(curl);
+        return false;
+    }
+
+    long http_code = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+    if (http_code != 200) {
+        std::cerr << "[Thread " << threadId << "] ERROR: HTTP " << http_code << " - " << pageUrl << std::endl;
+        curl_slist_free_all(headers);
+        curl_easy_cleanup(curl);
+        return false;
+    }
+
+    saveContentToFile(response, savePath);
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+    return true;
+}
+
+void Crawler::extractAndDownloadAssets(const std::string& html, const std::string& baseUrl) {
+    std::smatch match;
+    // More specific regex patterns
+    std::vector<std::regex> patterns = {
+        std::regex(R"(<link[^>]+href=["']([^"']+\.(css|js))["'])"),
+        std::regex(R"(<script[^>]+src=["']([^"']+\.js)["'])"),
+        std::regex(R"(<img[^>]+src=["']([^"']+\.(png|jpg|jpeg|gif))["'])")
+    };
+
+    std::set<std::string> downloadedUrls; // Prevent duplicate URLs
+    int assetCount = 0;
+    const int MAX_ASSETS = 10; // Maximum 10 assets per site
+
+    for (const auto& pattern : patterns) {
+        if (assetCount >= MAX_ASSETS) break;
+
+        std::string::const_iterator searchStart(html.cbegin());
+        while (std::regex_search(searchStart, html.cend(), match, pattern) && assetCount < MAX_ASSETS) {
+            std::string assetUrl = match[1].str();
             
-            for (size_t i = 0; i < results.size(); i++) {
-                const auto& result = results[i];
-                std::string sourceUrl = result.url;
-                std::string sourceDomain = Parser::getDomainFromUrl(sourceUrl);
-                
-                for (const auto& link : result.links) {
-                    // Determine link type
-                    std::string linkType = "External";
-                    if (link.find("javascript:") == 0) {
-                        linkType = "JavaScript";
-                    } else if (link.find("mailto:") == 0) {
-                        linkType = "Email";
-                    } else if (link.find("tel:") == 0) {
-                        linkType = "Telephone";
-                    } else if (link.find('#') == 0) {
-                        linkType = "Anchor";
-                    } else if (link.find('/') == 0) {
-                        linkType = "Relative (Root)";
-                    } else if (link.find("://") == std::string::npos) {
-                        linkType = "Relative";
-                    } else {
-                        // Check if same domain
-                        std::string linkDomain = Parser::getDomainFromUrl(link);
-                        if (linkDomain == sourceDomain) {
-                            linkType = "Internal";
-                        }
+            // Fix URL
+            if (assetUrl.find("//") == 0) {
+                assetUrl = "https:" + assetUrl;
+            } else if (assetUrl.find("http") != 0) {
+                if (assetUrl[0] == '/') {
+                    assetUrl = baseUrl + assetUrl;
+                } else {
+                    assetUrl = baseUrl + "/" + assetUrl;
+                }
+            }
+
+            // Clean unnecessary characters from URL
+            size_t pos = assetUrl.find_first_of("\"\'");
+            if (pos != std::string::npos) {
+                assetUrl = assetUrl.substr(0, pos);
+            }
+
+            // If this URL hasn't been downloaded yet
+            if (downloadedUrls.find(assetUrl) == downloadedUrls.end()) {
+                std::string filename = assetUrl.substr(assetUrl.find_last_of("/") + 1);
+                filename = sanitizeFilename(filename);
+                if (!filename.empty()) {
+                    std::string savePath = folderName + "/" + filename;
+                    if (downloadPage(assetUrl, savePath)) {
+                        downloadedUrls.insert(assetUrl);
+                        assetCount++;
                     }
-                    
-                    linkStream << formatUrlForCsv(sourceUrl) << ", "
-                               << formatUrlForCsv(link) << ", "
-                               << linkType << "\n";
                 }
             }
-            
-            linkStream.close();
-            std::cout << "Links saved to " << linksFile << std::endl;
+
+            searchStart = match.suffix().first;
         }
     }
-    
-    // Save images to a separate file
-    if (hasImages) {
-        std::string imagesFile = outputFile.substr(0, outputFile.find_last_of('.')) + "_images.csv";
-        std::ofstream imageStream(imagesFile);
+}
+
+void Crawler::crawlLinksFromHtml(const std::string& html, const std::string& baseUrl) {
+    std::smatch match;
+    std::regex pattern(R"(<a\s+(?:[^>]*?\s+)?href=["']([^"']+)["'])");
+
+    std::string::const_iterator searchStart(html.cbegin());
+    int linkCount = 0;
+    const int MAX_LINKS = 2; // Maximum 2 links
+
+    while (std::regex_search(searchStart, html.cend(), match, pattern) && linkCount < MAX_LINKS) {
+        std::string link = match[1].str();
         
-        if (imageStream.is_open()) {
-            imageStream << "Source URL, Image URL, Is Relative\n";
-            
-            for (size_t i = 0; i < results.size(); i++) {
-                const auto& result = results[i];
-                for (const auto& image : result.images) {
-                    bool isRelative = (image.find("://") == std::string::npos);
-                    imageStream << formatUrlForCsv(result.url) << ", "
-                                << formatUrlForCsv(image) << ", "
-                                << (isRelative ? "Yes" : "No") << "\n";
-                }
+        // Fix URL
+        if (link.find("//") == 0) {
+            link = "https:" + link;
+        } else if (link.find("http") != 0) {
+            if (link[0] == '/') {
+                link = baseUrl + link;
+            } else {
+                link = baseUrl + "/" + link;
             }
-            
-            imageStream.close();
-            std::cout << "Images saved to " << imagesFile << std::endl;
         }
-    }
-    
-    // Save headings to a separate file
-    if (hasHeadings) {
-        std::string headingsFile = outputFile.substr(0, outputFile.find_last_of('.')) + "_headings.csv";
-        std::ofstream headingStream(headingsFile);
-        
-        if (headingStream.is_open()) {
-            headingStream << "Source URL, Heading Text\n";
-            
-            for (size_t i = 0; i < results.size(); i++) {
-                const auto& result = results[i];
-                for (const auto& heading : result.headings) {
-                    headingStream << formatUrlForCsv(result.url) << ", "
-                                  << Utils::escapeCsvField(heading) << "\n";
-                }
-            }
-            
-            headingStream.close();
-            std::cout << "Headings saved to " << headingsFile << std::endl;
+
+        // Clean unnecessary characters from URL
+        size_t pos = link.find_first_of("\"\'");
+        if (pos != std::string::npos) {
+            link = link.substr(0, pos);
         }
+
+        std::string filename = "linked_" + std::to_string(linkCount) + ".html";
+        downloadPage(link, folderName + "/" + filename);
+        linkCount++;
+        searchStart = match.suffix().first;
     }
-    
-    file.close();
-} 
+}
+
+void Crawler::saveContentToFile(const std::string& content, const std::string& filePath) {
+    try {
+        std::ofstream out(filePath, std::ios::binary);
+        if (!out.is_open()) {
+            std::cerr << "[Thread " << threadId << "] ERROR: File not written: " << filePath << std::endl;
+            return;
+        }
+        out << content;
+        out.close();
+    } catch (const std::exception& e) {
+        std::cerr << "[Thread " << threadId << "] ERROR: File write error: " << e.what() << std::endl;
+    }
+}
